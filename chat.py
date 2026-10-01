@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import os
 import sys
 import textwrap
@@ -31,20 +32,21 @@ from textual.widgets import Input, Static
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_LEFT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_RIGHT_MODEL = "openai/gpt-4o-mini"
-DEFAULT_LEFT_NAME = "Ada"
-DEFAULT_RIGHT_NAME = "Lin"
+DEFAULT_LEFT_NAME = "Bob"
+DEFAULT_RIGHT_NAME = "Alice"
 DEFAULT_OBSERVER_NAME = "Observer"
 DEFAULT_REPLIES = -1  # per bot; -1 is unlimited
 DEFAULT_STARTER = "left"  # "left" or "right"
-DEFAULT_TOPIC = "Introduce yourselves, and get to know each other."
-LEFT_PERSONA = "You are curious and warm, and you ask specific questions."
-RIGHT_PERSONA = "You are concise and a little skeptical, and you want a concrete example."
+DEFAULT_TOPIC = "You both wake up able to speak only in questions for one hour. Start the hour."
+LEFT_PERSONA = "You treat odd opinions as proof of a real person, and you push for the one they would actually get judged for."
+RIGHT_PERSONA = "You think private opinions should stay private, and you call out anything that sounds rehearsed or performed."
 DEFAULT_PACE_THRESHOLD = 2.0  # seconds; faster replies count as too fast
 DEFAULT_PACE_STEP = 0.75  # extra seconds added for each consecutive fast reply
 DEFAULT_PACE_MAX = 5.0  # longest pacing delay, in seconds
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_TOKENS = 280
 DEFAULT_LOG_DIR = "logs"
+DEFAULT_EMPTY_BEFORE_POST = 8  # empty stream updates before a thinking bubble is posted
 
 
 @dataclass
@@ -69,6 +71,7 @@ class Config:
     max_tokens: int
     base_url: str
     observer: str
+    empty_before_post: int
 
     def bot(self, side: str) -> BotConfig:
         return self.left if side == "left" else self.right
@@ -90,6 +93,7 @@ class Config:
                 f"temperature: {self.temperature}",
                 f"max tokens: {self.max_tokens}",
                 f"base url: {self.base_url}",
+                f"empty updates before post: {self.empty_before_post}",
             ]
         )
 
@@ -255,6 +259,11 @@ def messages_for(side: str, history: list[Turn], config: Config) -> list[dict[st
     return payload
 
 
+async def _maybe_await(value: object) -> None:
+    if inspect.isawaitable(value):
+        await value
+
+
 def strip_name_prefix(name: str, text: str) -> str:
     stripped = text.strip()
     for prefix in (f"{name}:", f"{name}："):
@@ -307,7 +316,8 @@ class OpenRouterCompleter:
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
-        on_delta: Callable[[str], None],
+        on_delta: Callable[[str], object],
+        on_empty: Callable[[], object] | None = None,
     ) -> str:
         stream = await self.client.chat.completions.create(
             model=model,
@@ -322,9 +332,11 @@ class OpenRouterCompleter:
                 continue
             piece = coerce_content(chunk.choices[0].delta.content)
             if not piece:
+                if on_empty is not None:
+                    await _maybe_await(on_empty())
                 continue
             parts.append(piece)
-            on_delta(piece)
+            await _maybe_await(on_delta(piece))
         return "".join(parts)
 
 
@@ -628,21 +640,44 @@ class ChatApp(App[None]):
             return False
 
         self._set_status(f"thinking · {bot.name} · {bot.model}", "thinking")
-        bubble = Bubble(bot.name, side, "…")
-        await transcript.add(bubble)
+        bubble: Bubble | None = None
         history_at_start = len(self.history)
         collected: list[str] = []
         started = False
+        empty_count = 0
+        phase = "thinking"
 
-        def on_delta(piece: str) -> None:
-            nonlocal started
+        async def ensure_bubble(text: str) -> None:
+            nonlocal bubble
+            if bubble is None:
+                bubble = Bubble(bot.name, side, text)
+                await transcript.add(bubble)
+                return
+            bubble.set_body(text)
+            transcript.follow_bottom()
+
+        async def on_empty() -> None:
+            nonlocal empty_count, phase
+            if started:
+                return
+            empty_count += 1
+            if empty_count < self.config.empty_before_post:
+                return
+            if phase != "pending":
+                phase = "pending"
+                self._set_status(f"pending · {bot.name} · {bot.model}", "thinking")
+            if bubble is None:
+                await ensure_bubble("thinking")
+
+        async def on_delta(piece: str) -> None:
+            nonlocal started, phase
             if not started:
                 collected.clear()
                 started = True
+                phase = "replying"
                 self._set_status(f"replying · {bot.name} · {bot.model}", "replying")
             collected.append(piece)
-            bubble.set_body("".join(collected))
-            transcript.follow_bottom()
+            await ensure_bubble("".join(collected))
 
         started_at = time.monotonic()
         task = asyncio.create_task(
@@ -652,6 +687,7 @@ class ChatApp(App[None]):
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
                 on_delta=on_delta,
+                on_empty=on_empty,
             )
         )
         waiter = asyncio.create_task(self._cancel_reply.wait())
@@ -666,7 +702,8 @@ class ChatApp(App[None]):
                 await task
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await waiter
-            await bubble.remove()
+            if bubble is not None:
+                await bubble.remove()
             self.chat_log.record(
                 "status",
                 f"interrupted {bot.name} to read {self.config.observer}",
@@ -683,7 +720,8 @@ class ChatApp(App[None]):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await bubble.remove()
+            if bubble is not None:
+                await bubble.remove()
             message = short_error(exc)
             self._finished = True
             self._set_status(f"stopped · {message}", "error")
@@ -694,7 +732,12 @@ class ChatApp(App[None]):
         text = strip_name_prefix(bot.name, raw)
         if not text:
             text = "(no reply)"
-        bubble.set_body(text)
+        if bubble is None:
+            bubble = Bubble(bot.name, side, text)
+            await transcript.add(bubble)
+        else:
+            bubble.set_body(text)
+            transcript.follow_bottom()
         elapsed = time.monotonic() - started_at
         turn = Turn(side, bot.name, text)
         arrived = self.history[history_at_start:]
@@ -823,6 +866,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help=f"sampling temperature (default: {DEFAULT_TEMPERATURE})")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help=f"token cap for each reply (default: {DEFAULT_MAX_TOKENS})")
+    parser.add_argument(
+        "--empty-before-post",
+        type=int,
+        default=DEFAULT_EMPTY_BEFORE_POST,
+        help=(
+            "empty stream updates to wait through before posting a thinking bubble "
+            f"(default: {DEFAULT_EMPTY_BEFORE_POST})"
+        ),
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help=f"API base URL (default: {DEFAULT_BASE_URL})")
     parser.add_argument(
         "--log",
@@ -851,6 +903,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"{flag} must be zero or greater")
     if args.max_tokens < 1:
         parser.error("--max-tokens must be at least 1")
+    if args.empty_before_post < 1:
+        parser.error("--empty-before-post must be at least 1")
     if not args.left_name.strip() or not args.right_name.strip() or not args.observer_name.strip():
         parser.error("bot and observer names cannot be empty")
     if not args.left_model.strip() or not args.right_model.strip():
@@ -890,6 +944,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         max_tokens=args.max_tokens,
         base_url=args.base_url,
         observer=args.observer_name.strip(),
+        empty_before_post=args.empty_before_post,
     )
 
 
