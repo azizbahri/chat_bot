@@ -1,0 +1,7 @@
+#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+if [ ! -x .venv/bin/python ]; then
+  echo "No virtualenv at .venv. Create one and install requirements.txt." >&2
+  exit 1
+fi
+exec .venv/bin/python chat.py "$@"
